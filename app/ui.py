@@ -4,11 +4,11 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
 
+from osutil import enable_hidpi, open_path, restart_app, wheel_units
 from store import (BOOK_EXTS, DB_NAME, DEFAULT_BOOKS_DIR, DEFAULT_DATA_DIR, PALETTE,
                    STATUS_ICON, STATUS_KEYS, STATUS_LABEL, Library, load_config, load_pref,
                    norm_dir, progress, save_config, save_pref)
@@ -60,7 +60,8 @@ def filter_label(token):
 def fmt_date(iso):
     try:
         y, m, d = (int(x) for x in iso.split("-"))
-        return datetime.date(y, m, d).strftime("%-d %b %Y")
+        day = datetime.date(y, m, d)
+        return f"{day.day} {day:%b %Y}"     # no %-d: Windows strftime lacks it
     except (ValueError, AttributeError):
         return iso or ""
 
@@ -110,7 +111,7 @@ def fit(text, font, width):
 def bind_wheel(canvas):
     canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-3, "units"))
     canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(3, "units"))
-    canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-e.delta // 40, "units"))
+    canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(wheel_units(e.delta), "units"))
 
 
 def draw_chip(c, x, y, text, color, font, style="solid", tags=()):
@@ -1009,8 +1010,11 @@ class Theme:
             self._recolor(child, by_old)
 
     def _fonts(self):
-        serif = pick_family(["Noto Serif", "DejaVu Serif", "Liberation Serif"])
-        sans = pick_family(["Noto Sans", "Ubuntu", "Cantarell", "DejaVu Sans"])
+        # Linux first, then Windows / macOS equivalents.
+        serif = pick_family(["Noto Serif", "DejaVu Serif", "Liberation Serif",
+                             "Georgia", "Cambria", "Times New Roman"])
+        sans = pick_family(["Noto Sans", "Ubuntu", "Cantarell", "DejaVu Sans",
+                            "Segoe UI", "Helvetica Neue", "Arial"])
         self.f_title = tkfont.Font(family=serif, size=12, weight="bold")
         self.f_sub = tkfont.Font(family=serif, size=10, slant="italic")
         self.f_chip = tkfont.Font(family=sans, size=8, weight="bold")
@@ -1664,8 +1668,12 @@ class App:
         for r in self.cards.selected()[:5]:
             p = self.lib.abspath(r)
             if os.path.exists(p):
-                subprocess.Popen(["xdg-open", p], stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
+                try:
+                    open_path(p)
+                except OSError as e:
+                    messagebox.showerror("Koobs", f"Could not open the book:\n{e}",
+                                         parent=self.root)
+                    return
             else:
                 messagebox.showwarning("Koobs", f"File not found:\n{p}", parent=self.root)
 
@@ -1692,10 +1700,11 @@ class App:
         save_config(books, data)
         self.data_dir = data       # so the panel/window state is saved to the new place
         self._on_close()           # saves panel state, destroys the window
-        os.execv(sys.executable, [sys.executable] + sys.argv)  # restart cleanly
+        restart_app()              # a fresh Koobs starts; this one exits as mainloop ends
 
 
 def main():
+    enable_hidpi()
     root = tk.Tk()
     root.withdraw()                # stay hidden until locations are known
     root.title("Koobs")

@@ -34,20 +34,46 @@ book in there somewhere, and you started *something* last month but can't rememb
 
 ---
 
-## Get started in 10 seconds
+## Get started
+
+Koobs runs on **Linux, Windows and macOS**. All you need is **Python 3.10+**.
+
+<table>
+<tr><th>🐧 Linux</th><th>🪟 Windows</th><th>🍎 macOS</th></tr>
+<tr valign="top"><td>
 
 ```sh
-git clone <this repo> koobs && cd koobs
+git clone <this repo> koobs
+cd koobs
 ./run.sh
 ```
+Missing Tkinter? Run<br>`sudo apt install python3-tk`
+
+</td><td>
+
+1. Install Python from [python.org](https://www.python.org/downloads/). Tick **"Add python.exe to PATH"**.
+2. **Code → Download ZIP** on GitHub, then unzip.
+3. Double-click **`Koobs.pyw`** (or `Koobs.bat`).
+
+</td><td>
+
+1. Install Python from [python.org](https://www.python.org/downloads/). It includes Tkinter.
+2. Clone or download the repo.
+3. In Terminal:
+```sh
+cd koobs && ./run.sh
+```
+
+</td></tr>
+</table>
 
 That's it. On first launch Koobs asks two questions:
 
 > **Where are your books?** → any folder (subfolders included)
 > **Where should Koobs keep its notes?** → defaults to a hidden `.local/` folder right here
 
-<sub>Needs Python 3.10+ with Tkinter (`sudo apt install python3-tk` if missing).
-<code>zenity</code>, <code>gio</code> and <code>xdg-open</code> are used when present, for native file pickers, the desktop Trash and opening books.</sub>
+<sub>Koobs fits in with each system: books open in your default reader, and deleted books go to the
+Trash (Linux, macOS) or the Recycle Bin (Windows). On Linux, <code>zenity</code> gives native file pickers when it's installed.</sub>
 
 ---
 
@@ -109,10 +135,13 @@ remembers your layout, window size and theme.
 Koobs never renames or reorganizes your books. All it keeps is a small JSON notebook:
 
 ```
-~/.config/koobs/config.json   where your books and data live, plus your theme
-<data>/library.json           tags, colors, statuses, page progress
-<data>/ui.json                panel sizes, window size
+config.json        where your books and data live, plus your theme
+<data>/library.json   tags, colors, statuses, page progress
+<data>/ui.json        panel sizes, window size
 ```
+
+`config.json` lives in your system's usual settings folder: `~/.config/koobs/` on Linux,
+`%APPDATA%\Koobs\` on Windows, and `~/Library/Application Support/Koobs/` on macOS.
 
 - Point Koobs at a different folder (even a parent or child of the old one) and every tag, status and page number is **re-mapped automatically**. Nothing is duplicated or lost.
 - Every save is atomic: written to a temp file, then swapped in.
@@ -127,8 +156,11 @@ app/
 ├── koobs.py    entry point
 ├── ui.py       the interface: themes, card list, sidebar, dialogs
 ├── store.py    the library: config, scanning, tags, status, import / trash / move-out
+├── osutil.py   OS specifics: open files, Trash / Recycle Bin, settings folder
 └── tagger.py   one-off bulk tagger used to seed the first library
-run.sh          launcher
+run.sh          launcher for Linux / macOS
+Koobs.pyw       double-click launcher for Windows (no console window)
+Koobs.bat       Windows launcher that also explains how to install Python
 ```
 
 The card list and sidebar are drawn by hand on a Tk canvas. That's how a stock Tkinter app gets

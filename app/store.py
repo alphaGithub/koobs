@@ -5,8 +5,8 @@ import json
 import os
 import re
 import shutil
-import subprocess
-import urllib.parse
+
+from osutil import config_dir, move_to_trash  # noqa: F401  (re-exported)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_BOOKS_DIR = os.path.join(ROOT, "All")
@@ -32,9 +32,8 @@ def progress(book):
 
 # Where the chosen locations are remembered. Lives outside the data folder,
 # because the data folder itself is configurable. KOOBS_CONFIG overrides (tests).
-CONFIG_PATH = os.environ.get("KOOBS_CONFIG") or os.path.join(
-    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
-    "koobs", "config.json")
+# Linux: ~/.config/koobs · Windows: %APPDATA%\Koobs · macOS: ~/Library/Application Support/Koobs
+CONFIG_PATH = os.environ.get("KOOBS_CONFIG") or os.path.join(config_dir(), "config.json")
 
 
 def norm_dir(path):
@@ -117,34 +116,6 @@ def parse_name(filename):
     if m:
         return m.group(1).strip(), m.group(2).strip()
     return stem.replace("_", " ").strip(), ""
-
-
-def move_to_trash(path):
-    """Send a file to the desktop Trash (restorable from the file manager)."""
-    if shutil.which("gio"):
-        r = subprocess.run(["gio", "trash", "--", path], capture_output=True, text=True)
-        if r.returncode == 0:
-            return
-        if not os.path.lexists(path):
-            return
-    # Fallback: freedesktop.org Trash spec, home trash.
-    base = os.path.join(os.environ.get("XDG_DATA_HOME") or
-                        os.path.expanduser("~/.local/share"), "Trash")
-    files, info = os.path.join(base, "files"), os.path.join(base, "info")
-    os.makedirs(files, exist_ok=True)
-    os.makedirs(info, exist_ok=True)
-    name = os.path.basename(path)
-    stem, ext = os.path.splitext(name)
-    target, n = name, 1
-    while os.path.lexists(os.path.join(files, target)) or \
-            os.path.lexists(os.path.join(info, target + ".trashinfo")):
-        n += 1
-        target = f"{stem}.{n}{ext}"
-    with open(os.path.join(info, target + ".trashinfo"), "w", encoding="utf-8") as f:
-        f.write("[Trash Info]\nPath={}\nDeletionDate={}\n".format(
-            urllib.parse.quote(os.path.abspath(path)),
-            datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")))
-    shutil.move(path, os.path.join(files, target))
 
 
 def _merge_entry(keep, other):

@@ -1,2 +1,4 @@
 #!/bin/sh
-exec python3 "$(dirname "$(readlink -f "$0")")/app/koobs.py" "$@"
+# Koobs launcher for Linux and macOS.
+here="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$here/app/koobs.py" "$@"

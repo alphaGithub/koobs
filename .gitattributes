@@ -1,0 +1,6 @@
+# Keep launchers working after a clone on any OS.
+*.bat   text eol=crlf
+*.sh    text eol=lf
+*.py    text eol=lf
+*.pyw   text eol=lf
+*.png   binary
