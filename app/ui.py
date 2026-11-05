@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
 
+import sync
 from osutil import enable_hidpi, open_path, restart_app, wheel_units
 from store import (BOOK_EXTS, DB_NAME, DEFAULT_BOOKS_DIR, DEFAULT_DATA_DIR, PALETTE,
                    STATUS_ICON, STATUS_KEYS, STATUS_LABEL, Library, load_config, load_pref,
@@ -660,6 +661,69 @@ def confirm_move_out(app, rels, dest):
                              "Primary.TButton", rels)
 
 
+# ---------------------------------------------------------------- sync helpers
+def _now():
+    return round(datetime.datetime.now().timestamp())
+
+
+def _ago(ts):
+    secs = _now() - int(ts)
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60} min ago"
+    when = datetime.datetime.fromtimestamp(ts)
+    if when.date() == datetime.date.today():
+        return f"today at {when:%H:%M}"
+    return f"on {when.day} {when:%b} at {when:%H:%M}"
+
+
+def confirm_sync_removals(app, plan):
+    """Many books were removed on another device. Returns "trash", "keep" or "cancel"."""
+    old = (plan.checkpoint or {}).get("books", {})
+    titles = [old.get(k, {}).get("title", k) for k in plan.local_trash]
+    n = len(titles)
+    top = tk.Toplevel(app.root, bg=INK["paper"])
+    top.title("Sync")
+    top.transient(app.root)
+    top.resizable(False, False)
+    result = {"choice": "cancel"}
+    f = ttk.Frame(top)
+    f.pack(fill=tk.BOTH, expand=True, padx=22, pady=18)
+    ttk.Label(f, text=f"{n} books were removed on another device", font=app.f_title,
+              wraplength=460, justify="left").pack(anchor="w")
+    names = "\n".join(f"•  {t}" for t in titles[:6]) + (f"\n…and {n - 6} more" if n > 6 else "")
+    ttk.Label(f, text=names, style="Muted.TLabel", wraplength=460,
+              justify="left").pack(anchor="w", pady=(8, 0))
+    ttk.Label(f, text="Syncing will move this device's copies to the Trash, where you can "
+                      "still restore them. Or keep them here, and they'll be added back on "
+                      "your other devices too.", style="Muted.TLabel", wraplength=460,
+              justify="left").pack(anchor="w", pady=(10, 16))
+
+    def done(choice):
+        result["choice"] = choice
+        top.destroy()
+    btns = ttk.Frame(f)
+    btns.pack(fill=tk.X)
+    ttk.Button(btns, text="Move to Trash", style="DangerFill.TButton",
+               command=lambda: done("trash")).pack(side=tk.RIGHT)
+    ttk.Button(btns, text="Keep them here",
+               command=lambda: done("keep")).pack(side=tk.RIGHT, padx=8)
+    cancel = ttk.Button(btns, text="Cancel sync", command=lambda: done("cancel"))
+    cancel.pack(side=tk.LEFT)
+    top.bind("<Escape>", lambda e: done("cancel"))
+    top.protocol("WM_DELETE_WINDOW", lambda: done("cancel"))
+    top.update_idletasks()
+    x = app.root.winfo_rootx() + (app.root.winfo_width() - top.winfo_reqwidth()) // 2
+    y = app.root.winfo_rooty() + (app.root.winfo_height() - top.winfo_reqheight()) // 3
+    top.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    top.wait_visibility()
+    top.grab_set()
+    cancel.focus_set()
+    app.root.wait_window(top)
+    return result["choice"]
+
+
 # ---------------------------------------------------------------- tooltip
 class Tooltip:
     def __init__(self, widget, text, delay=450):
@@ -748,7 +812,7 @@ def count_books(folder):
 class LocationsDialog:
     """First-run welcome / later 'Library locations'. result = (books_dir, data_dir)."""
 
-    def __init__(self, root, theme, books_dir, data_dir, first_run):
+    def __init__(self, root, theme, books_dir, data_dir, first_run, note=None):
         self.root, self.t, self.result = root, theme, None
         self.first_run = first_run
         self.orig = (books_dir, data_dir)
@@ -768,7 +832,10 @@ class LocationsDialog:
                  if first_run else
                  "Koobs restarts after saving. Your books are never moved by this.")
         ttk.Label(f, text=intro, style="Muted.TLabel", wraplength=520,
-                  justify="left").pack(anchor="w", pady=(4, 14))
+                  justify="left").pack(anchor="w", pady=(4, 6 if note else 14))
+        if note:
+            ttk.Label(f, text="⚠  " + note, wraplength=520,
+                      justify="left").pack(anchor="w", pady=(0, 14))
 
         self.books = tk.StringVar(value=books_dir)
         self.data = tk.StringVar(value=data_dir)
@@ -921,6 +988,14 @@ class SettingsDialog:
         ttk.Button(f, text="Change locations…", command=self._locations).pack(anchor="w",
                                                                              pady=(10, 0))
 
+        if sync.SUPPORTED:                    # Linux only, by design
+            ttk.Label(f, text="SYNC  ·  GOOGLE DRIVE", style="Cap.TLabel").pack(anchor="w",
+                                                                              pady=(18, 6))
+            self.sync_box = ttk.Frame(f)
+            self.sync_box.pack(fill=tk.X)
+            self._connect_job = None
+            self._render_sync()
+
         btns = ttk.Frame(f)
         btns.pack(fill=tk.X, pady=(20, 0))
         ttk.Button(btns, text="Done", style="Primary.TButton",
@@ -966,6 +1041,118 @@ class SettingsDialog:
     def _locations(self):
         self.top.destroy()
         self.app.edit_locations()
+
+    # -- sync section
+    def _render_sync(self, waiting=None):
+        box, a = self.sync_box, self.app
+        for w in box.winfo_children():
+            w.destroy()
+
+        def line(text, style="Muted.TLabel", pady=0):
+            ttk.Label(box, text=text, style=style, wraplength=660,
+                      justify="left").pack(anchor="w", pady=pady)
+
+        if not sync.rclone_path():
+            line("Sync uses rclone, a free tool for cloud storage. Install it, then click "
+                 "Check again:")
+            cmd = ttk.Entry(box, width=30)
+            cmd.insert(0, "sudo apt install rclone")
+            cmd.state(["readonly"])
+            cmd.pack(anchor="w", pady=6)
+            ttk.Button(box, text="Check again", command=self._render_sync).pack(anchor="w")
+            return
+        if waiting is not None:
+            line("Waiting for you to sign in to Google in your browser…", "TLabel")
+            line(waiting or "If no browser window opened, check that a browser is installed.",
+                 pady=(4, 0))
+            return
+        cfg = a.sync_cfg()
+        if not cfg:
+            line("Keep your books, tags and reading progress the same on all your Linux "
+                 "computers. Koobs can only see the files it puts in a “Koobs” folder in "
+                 "your Drive, nothing else.")
+            row = ttk.Frame(box)
+            row.pack(anchor="w", pady=(10, 0))
+            ttk.Button(row, text="Connect Google Drive", style="Primary.TButton",
+                       command=self._connect).pack(side=tk.LEFT)
+            others = sync.list_remotes()
+            if others:
+                ttk.Label(row, text="   or use an existing rclone remote",
+                          style="Muted.TLabel").pack(side=tk.LEFT)
+                self.remote_pick = tk.StringVar(value=others[0])
+                ttk.Combobox(row, textvariable=self.remote_pick, values=others,
+                             state="readonly", width=16).pack(side=tk.LEFT, padx=6)
+                ttk.Button(row, text="Use",
+                           command=lambda: self._use_remote(self.remote_pick.get())
+                           ).pack(side=tk.LEFT)
+            return
+        line(f"Connected  ·  {cfg['remote']}{cfg['folder']}", "TLabel")
+        line(a.sync_status_text(), pady=(2, 0))
+        self.auto = tk.BooleanVar(value=cfg.get("auto", True))
+        ttk.Checkbutton(box, text="Sync automatically when Koobs opens and closes",
+                        variable=self.auto,
+                        command=lambda: a.update_sync_cfg(auto=self.auto.get())
+                        ).pack(anchor="w", pady=(8, 0))
+        row = ttk.Frame(box)
+        row.pack(anchor="w", pady=(10, 0))
+        ttk.Button(row, text="Sync now", style="Primary.TButton",
+                   command=self._sync_now).pack(side=tk.LEFT)
+        ttk.Button(row, text="Disconnect", command=self._disconnect).pack(side=tk.LEFT, padx=8)
+
+    def _connect(self):
+        self._connect_url = ""
+
+        def on_output(text):                               # worker thread
+            if "http" in text:
+                self._connect_url = text.strip()
+        self._connect_job = sync.Worker(sync.connect_google_drive,
+                                        sync.DEFAULT_REMOTE_NAME, on_output)
+        self._connect_job.start()
+        self._render_sync(waiting="")
+        self.top.after(300, self._poll_connect)
+
+    def _poll_connect(self):
+        if not self.top.winfo_exists():
+            return
+        job = self._connect_job
+        if not job.done:
+            if self._connect_url:
+                self._render_sync(waiting=self._connect_url)
+                self._connect_url = ""
+            self.top.after(300, self._poll_connect)
+            return
+        if job.error:
+            self._render_sync()
+            messagebox.showerror("Koobs", str(job.error), parent=self.top)
+            return
+        self._activate(job.result)
+
+    def _use_remote(self, remote):
+        try:
+            sync.check_remote(remote)
+        except sync.SyncError as e:
+            messagebox.showerror("Koobs", f"Can't use {remote}:\n{e}", parent=self.top)
+            return
+        self._activate(remote)
+
+    def _activate(self, remote):
+        self.app.update_sync_cfg(remote=remote, folder=sync.DEFAULT_FOLDER, auto=True)
+        self._render_sync()
+        if messagebox.askyesno("Koobs", "Connected to Google Drive.\n\nSync now? The first "
+                               "sync uploads your books, so it can take a while.",
+                               parent=self.top):
+            self._sync_now()
+
+    def _sync_now(self):
+        self.top.destroy()
+        self.app.start_sync(manual=True)
+
+    def _disconnect(self):
+        if messagebox.askyesno("Koobs", "Stop syncing on this computer?\n\nYour books and "
+                               "the copy on Google Drive stay exactly as they are.",
+                               parent=self.top):
+            self.app.disconnect_sync()
+            self._render_sync()
 
 
 # ---------------------------------------------------------------- theme
@@ -1070,6 +1257,10 @@ class Theme:
                     foreground=INK["muted"], padding=(2, 0), font=self.f_head)
         s.map("Icon.TButton", background=[("active", INK["sel"])],
               foreground=[("active", ink)], bordercolor=[("active", INK["sel"])])
+        s.configure("TCheckbutton", background=p, foreground=ink, indicatorcolor=INK["card"],
+                    indicatorbackground=INK["card"], focuscolor=p)
+        s.map("TCheckbutton", indicatorcolor=[("selected", ink)],
+              background=[("active", p)])
         s.configure("Seg.TButton", padding=(6, 4), bordercolor=rule)
         s.map("Seg.TButton", background=[("active", INK["sel"]), ("disabled", p)],
               foreground=[("disabled", INK["faint"])], bordercolor=[("active", ink)])
@@ -1108,9 +1299,15 @@ class App:
         root.title("Koobs")
         root.minsize(720, 480)
         root.configure(bg=INK["paper"])
+        self._sync_job = None          # the running sync's worker, if any
+        self._closing = None           # the "syncing before closing" dialog, if shown
         self._build()
         root.geometry(self.ui["geometry"])
         self.refresh()
+        self._update_sync_ui()
+        cfg = self.sync_cfg()
+        if cfg and cfg.get("auto", True):
+            root.after(800, self.start_sync)          # pull changes from other devices
 
     def __getattr__(self, name):  # fonts (f_title, f_sub, …) live on the theme
         if name.startswith("f_"):
@@ -1170,11 +1367,19 @@ class App:
                                     "Recently started", "Recently finished", "Progress"])
         sort.pack(side=tk.LEFT, padx=(4, 8))
         sort.bind("<<ComboboxSelected>>", lambda e: self.refresh_books())
-        ttk.Button(bar, text="Rescan", command=self.rescan).pack(side=tk.LEFT)
+        self.b_rescan = ttk.Button(bar, text="Rescan", command=self.rescan)
+        self.b_rescan.pack(side=tk.LEFT)
+        self.b_sync = ttk.Button(bar, text="⟳  Sync", width=13,
+                                 command=lambda: self.start_sync(manual=True))
+        Tooltip(self.b_sync, "Sync with Google Drive")
         ttk.Button(bar, text="+  Add books", style="Primary.TButton",
                    command=self.add_books).pack(side=tk.LEFT, padx=(8, 0))
-        self.status = ttk.Label(center, text="", style="Muted.TLabel")
-        self.status.pack(anchor="w", padx=16, pady=(2, 0))
+        srow = ttk.Frame(center)
+        srow.pack(fill=tk.X, padx=16, pady=(2, 0))
+        self.status = ttk.Label(srow, text="", style="Muted.TLabel")
+        self.status.pack(side=tk.LEFT)
+        self.sync_label = ttk.Label(srow, text="", style="Muted.TLabel")
+        self.sync_label.pack(side=tk.RIGHT)
         self.cards = CardList(center, self)
         self.cards.frame.pack(fill=tk.BOTH, expand=True)
 
@@ -1313,7 +1518,15 @@ class App:
         else:
             self.b_right.pack(side=tk.RIGHT, padx=(6, 0))
 
-    def _on_close(self):
+    def _on_close(self, skip_sync=False):
+        cfg = self.sync_cfg()
+        if not skip_sync and cfg and (cfg.get("auto", True) or self._sync_job):
+            self._close_after_sync()
+            return
+        if self._sync_job:
+            self._sync_remote.cancel()
+        if self._closing is not None:
+            self._closing.destroy()
         self._remember_widths()
         geo = self.root.geometry().split("+")[0]
         if self.root.state() == "normal":
@@ -1688,9 +1901,180 @@ class App:
         self.refresh()                 # redraw the hand-drawn parts (cards, sidebar, chips)
         self._draw_progress_bar()
 
+    # ------------------------------------------------------------ sync (Linux, rclone)
+    def sync_cfg(self):
+        cfg = load_pref("sync")
+        if sync.SUPPORTED and isinstance(cfg, dict) and cfg.get("remote"):
+            cfg.setdefault("folder", sync.DEFAULT_FOLDER)
+            return cfg
+        return None
+
+    def update_sync_cfg(self, **changes):
+        cfg = self.sync_cfg() or {"folder": sync.DEFAULT_FOLDER, "auto": True}
+        cfg.update(changes)
+        save_pref("sync", cfg)
+        self._update_sync_ui()
+
+    def disconnect_sync(self):
+        save_pref("sync", None)
+        self._update_sync_ui()
+
+    def sync_status_text(self):
+        if self._sync_job:
+            return "Syncing…"
+        cfg = self.sync_cfg()
+        if not cfg:
+            return ""
+        if cfg.get("last_error"):
+            return "Last sync failed: " + cfg["last_error"]
+        last = cfg.get("last_sync")
+        return f"Synced {_ago(last)}" if last else "Not synced yet"
+
+    def _update_sync_ui(self, progress_text=None):
+        cfg = self.sync_cfg()
+        if cfg:
+            if not self.b_sync.winfo_ismapped():
+                self.b_sync.pack(side=tk.LEFT, padx=(0, 8), before=self.b_rescan)
+            busy = self._sync_job is not None
+            self.b_sync.config(text=progress_text or ("Syncing…" if busy else "⟳  Sync"))
+            self.b_sync.state(["disabled"] if busy else ["!disabled"])
+            self.sync_label.config(text=("☁  " + self.sync_status_text()) if not busy else
+                                   "☁  " + (progress_text or "Syncing…"))
+        else:
+            self.b_sync.pack_forget()
+            self.sync_label.config(text="")
+
+    def start_sync(self, manual=False, on_done=None):
+        """Pull + merge + push. Slow steps run in a worker thread; this polls."""
+        cfg = self.sync_cfg()
+        if not cfg or self._sync_job:
+            return
+        if not sync.rclone_path():
+            self._sync_finish("rclone is not installed (sudo apt install rclone)", manual)
+            return
+        self.flush_edits()
+        self.lib.save()
+        self._sync_remote = sync.RcloneRemote(cfg["remote"], cfg["folder"])
+        self._sync_manual, self._sync_on_done = manual, on_done
+        self._sync_progress = None
+        self._sync_job = sync.Worker(sync.prepare, self.lib, self._sync_remote)
+        self._sync_job.start()
+        self._update_sync_ui("Checking Drive…")
+        self.root.after(150, self._sync_poll_prepare)
+
+    def _sync_poll_prepare(self):
+        job = self._sync_job
+        if not job.done:
+            self.root.after(150, self._sync_poll_prepare)
+            return
+        if job.error:
+            self._sync_finish(str(job.error))
+            return
+        try:
+            plan = sync.apply_merge(self.lib, job.result)
+            if sync.needs_confirmation(self.lib, plan):
+                plan = sync.resolve_removals(self.lib, plan, confirm_sync_removals(self, plan))
+                if plan is None:
+                    self.refresh()
+                    self._sync_finish("Cancelled — nothing was changed", quiet=True)
+                    return
+            failed = sync.trash_removed(self.lib, plan)
+        except (OSError, sync.SyncError) as e:
+            self._sync_finish(str(e))
+            return
+        self._sync_plan, self._sync_trash_failed = plan, failed
+        self.refresh()                       # merged tags/status show up right away
+
+        def progress(stage, done, total, files_done, files_total):   # worker thread
+            self._sync_progress = (stage, done, total, files_done, files_total)
+        self._sync_job = sync.Worker(sync.transfer, self.lib, self._sync_remote, plan, progress)
+        self._sync_job.start()
+        self.root.after(200, self._sync_poll_transfer)
+
+    def _sync_poll_transfer(self):
+        job = self._sync_job
+        if not job.done:
+            p = self._sync_progress
+            if p:
+                stage, done, total, fd, ft = p
+                pct = f" {round(done * 100 / total)}%" if total else ""
+                self._update_sync_ui(f"{stage}{pct}")
+                self.sync_label.config(text=f"☁  {stage} {fd}/{ft} books{pct}")
+                if self._closing is not None:
+                    self._closing_label.config(text=f"{stage} {fd} of {ft} books{pct}")
+            self.root.after(200, self._sync_poll_transfer)
+            return
+        if job.error:
+            self._sync_finish(str(job.error))
+            return
+        self.lib.scan()
+        self.lib.save()
+        self.refresh()
+        plan = self._sync_plan
+        parts = [f"{len(plan.downloads)} downloaded" if plan.downloads else "",
+                 f"{len(plan.uploads)} uploaded" if plan.uploads else "",
+                 f"{len(plan.local_trash)} moved to Trash" if plan.local_trash else ""]
+        summary = ", ".join(x for x in parts if x) or "already up to date"
+        if self._sync_trash_failed:
+            summary += f" ({len(self._sync_trash_failed)} could not be trashed)"
+        self._sync_finish(None, summary=summary)
+
+    def _sync_finish(self, error, manual=None, summary=None, quiet=False):
+        manual = self._sync_manual if manual is None else manual
+        self._sync_job = None
+        cfg = self.sync_cfg()
+        if cfg is not None and not quiet:
+            if error:
+                self.update_sync_cfg(last_error=error[:200])
+            else:
+                self.update_sync_cfg(last_sync=_now(), last_error=None)
+        self._update_sync_ui()
+        if error and not quiet:
+            self.sync_label.config(text="☁  Sync failed — click Sync to retry")
+            if manual and self._closing is None:
+                messagebox.showerror("Koobs", f"Sync failed:\n{error}", parent=self.root)
+        elif summary:
+            self.sync_label.config(text=f"☁  Synced — {summary}")
+        elif error:
+            self.sync_label.config(text=f"☁  {error}")
+        cb, self._sync_on_done = getattr(self, "_sync_on_done", None), None
+        if cb:
+            cb()
+
+    def _close_after_sync(self):
+        """Closing with sync on: push changes first, but never trap the user."""
+        if self._closing is not None:
+            return
+        top = self._closing = tk.Toplevel(self.root, bg=INK["paper"])
+        top.title("Koobs")
+        top.transient(self.root)
+        top.resizable(False, False)
+        f = ttk.Frame(top)
+        f.pack(fill=tk.BOTH, expand=True, padx=22, pady=18)
+        ttk.Label(f, text="Syncing with Google Drive before closing…",
+                  font=self.f_title).pack(anchor="w")
+        self._closing_label = ttk.Label(f, text="Checking Drive…", style="Muted.TLabel")
+        self._closing_label.pack(anchor="w", pady=(6, 14))
+        ttk.Button(f, text="Close without syncing",
+                   command=lambda: self._on_close(skip_sync=True)).pack(anchor="e")
+        top.protocol("WM_DELETE_WINDOW", lambda: self._on_close(skip_sync=True))
+        top.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - top.winfo_reqwidth()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - top.winfo_reqheight()) // 3
+        top.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        done = lambda: self._on_close(skip_sync=True)       # noqa: E731
+        if self._sync_job:                   # a sync is already running: wait for it
+            self._sync_on_done = done
+        else:
+            self.start_sync(on_done=done)
+
     def edit_locations(self):
+        note = None
+        if self.sync_cfg():
+            note = ("Sync is on: choosing a different books folder changes every book's path, "
+                    "and your other devices will be asked before anything moves there.")
         dlg = LocationsDialog(self.root, self.theme, self.books_dir, self.data_dir,
-                              first_run=False)
+                              first_run=False, note=note)
         self.root.wait_window(dlg.top)
         if not dlg.result:
             return
@@ -1699,7 +2083,7 @@ class App:
             return
         save_config(books, data)
         self.data_dir = data       # so the panel/window state is saved to the new place
-        self._on_close()           # saves panel state, destroys the window
+        self._on_close(skip_sync=True)   # saves panel state, destroys the window
         restart_app()              # a fresh Koobs starts; this one exits as mainloop ends
 
 

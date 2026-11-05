@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import time
 
 from osutil import config_dir, move_to_trash  # noqa: F401  (re-exported)
 
@@ -118,6 +119,20 @@ def parse_name(filename):
     return stem.replace("_", " ").strip(), ""
 
 
+def to_key(rel_os_path):
+    """Book keys always use '/' so a library.json is portable between machines."""
+    return rel_os_path.replace(os.sep, "/") if os.sep != "/" else rel_os_path
+
+
+# Fields that are per-device or bookkeeping, so they don't count as an edit.
+_VOLATILE = ("missing", "updated")
+
+
+def _fingerprint(book):
+    return json.dumps({k: v for k, v in book.items() if k not in _VOLATILE},
+                      sort_keys=True, ensure_ascii=False)
+
+
 def _merge_entry(keep, other):
     """Fold a duplicate book entry into `keep` without losing anything the user set."""
     for t in other.get("tags", []):
@@ -140,6 +155,12 @@ class Library:
         self.tags = []
         self.books = {}
         self.tag_colors = {}
+        # Sync bookkeeping (see save()/merge_from()): when each tag last changed,
+        # and when books/tags were removed ("tombstones", so a sync doesn't revive them).
+        self.tag_updated = {}
+        self.deleted = {}
+        self.deleted_tags = {}
+        self._snap_books, self._snap_tags = {}, {}
         self.load()
 
     # ---- colors ----
@@ -159,15 +180,148 @@ class Library:
         if os.path.exists(self.path):
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
-            self.tags = data.get("tags", [])
-            self.books = data.get("books", {})
-            self.tag_colors = data.get("tag_colors", {})
+            self._apply_data(data)
+            self._take_snapshot()
             old_root = data.get("books_dir")
             if old_root and os.path.abspath(old_root) != os.path.abspath(self.all_dir):
-                self._rebase(old_root)
+                self._rebase(old_root)      # changed keys get stamped on the next save
         for t in self.tags:
             if t not in self.tag_colors:
                 self.tag_colors[t] = self._next_color()
+
+    def _apply_data(self, data):
+        self.tags = list(data.get("tags", []))
+        self.books = {to_key(k): v for k, v in data.get("books", {}).items()}
+        self.tag_colors = dict(data.get("tag_colors", {}))
+        self.tag_updated = dict(data.get("tag_updated", {}))
+        self.deleted = {to_key(k): v for k, v in data.get("deleted", {}).items()}
+        self.deleted_tags = dict(data.get("deleted_tags", {}))
+
+    def _take_snapshot(self):
+        self._snap_books = {rel: _fingerprint(b) for rel, b in self.books.items()}
+        self._snap_tags = {t: self.tag_colors.get(t) for t in self.tags}
+
+    def _stamp_changes(self):
+        """Mark what changed since the last save with a time; record removals."""
+        now = round(time.time(), 3)
+        for rel, b in self.books.items():
+            if self._snap_books.get(rel) != _fingerprint(b):
+                b["updated"] = now
+                self.deleted.pop(rel, None)
+        for rel in self._snap_books:
+            if rel not in self.books:
+                self.deleted[rel] = now
+        for t in self.tags:
+            if t not in self._snap_tags or self._snap_tags[t] != self.tag_colors.get(t):
+                self.tag_updated[t] = now
+                self.deleted_tags.pop(t, None)
+        for t in self._snap_tags:
+            if t not in self.tags:
+                self.deleted_tags[t] = now
+                self.tag_updated.pop(t, None)
+
+    def to_data(self):
+        self.tags.sort(key=str.lower)
+        return {"version": 2,
+                # Book keys are relative to this folder; used to remap if it changes.
+                "books_dir": os.path.abspath(self.all_dir),
+                "tags": self.tags,
+                "tag_colors": {t: self.tag_colors[t] for t in self.tags if t in self.tag_colors},
+                "tag_updated": {t: self.tag_updated[t] for t in self.tags
+                                if t in self.tag_updated},
+                "books": dict(sorted(self.books.items(), key=lambda kv: kv[0].lower())),
+                "deleted": dict(sorted(self.deleted.items())),
+                "deleted_tags": dict(sorted(self.deleted_tags.items()))}
+
+    # ---- sync: checkpoints, so a sync can be undone before any file is touched ----
+    def checkpoint(self):
+        return json.loads(json.dumps(self.to_data()))
+
+    def rollback(self, cp):
+        """Restore a checkpoint exactly (no change stamps) and write it to disk."""
+        self._apply_data(cp)
+        self._take_snapshot()
+        self.save()
+
+    def touch(self, rels):
+        """Mark books as just edited, so they win over removals from other devices."""
+        now = round(time.time(), 3)
+        for rel in rels:
+            if rel in self.books:
+                self.books[rel]["updated"] = now
+                self.deleted.pop(rel, None)
+        self._take_snapshot()
+        self.save()
+
+    # ---- sync: merge another copy of library.json into this one ----
+    def merge_from(self, remote):
+        """Merge another device's library data (a dict) into this library and save.
+
+        Per book and per tag, the newest change wins: an edit (book["updated"],
+        tag_updated) or a removal (deleted / deleted_tags). Device-only fields such as
+        "missing" are never taken from the other side. Safe to repeat.
+        Returns counts: {"books_in", "books_removed", "tags_in", "tags_removed"}.
+        """
+        self.save()                                  # stamp any pending local edits
+        r_books = {to_key(k): v for k, v in remote.get("books", {}).items()}
+        r_del = {to_key(k): v for k, v in remote.get("deleted", {}).items()}
+        stats = {"books_in": 0, "books_removed": 0, "tags_in": 0, "tags_removed": 0}
+
+        for k in set(self.books) | set(r_books) | set(self.deleted) | set(r_del):
+            lb, rb = self.books.get(k), r_books.get(k)
+            best = lb
+            if rb is not None and (lb is None or rb.get("updated", 0) > lb.get("updated", 0)):
+                best = rb
+            best_ts = best.get("updated", 0) if best else None
+            del_ts = max(self.deleted.get(k, 0), r_del.get(k, 0)) or None
+            if del_ts is not None and (best is None or del_ts >= best_ts):
+                if lb is not None:
+                    stats["books_removed"] += 1
+                    del self.books[k]
+                self.deleted[k] = del_ts
+            elif best is not lb:
+                entry = {kk: vv for kk, vv in best.items() if kk != "missing"}
+                if lb is not None and lb.get("missing"):
+                    entry["missing"] = True
+                self.books[k] = entry
+                self.deleted.pop(k, None)
+                stats["books_in"] += 1
+
+        r_tags = set(remote.get("tags", []))
+        r_colors, r_tu = remote.get("tag_colors", {}), remote.get("tag_updated", {})
+        r_dt = remote.get("deleted_tags", {})
+        for t in set(self.tags) | r_tags | set(self.deleted_tags) | set(r_dt):
+            here, there = t in self.tags, t in r_tags
+            l_ts = self.tag_updated.get(t, 0) if here else None
+            r_ts = r_tu.get(t, 0) if there else None
+            live_ts = max(x for x in (l_ts, r_ts, -1) if x is not None)
+            del_ts = max(self.deleted_tags.get(t, 0), r_dt.get(t, 0)) or None
+            if del_ts is not None and (not (here or there) or del_ts >= live_ts):
+                if here:
+                    self.tags.remove(t)
+                    self.tag_colors.pop(t, None)
+                    self.tag_updated.pop(t, None)
+                    stats["tags_removed"] += 1
+                self.deleted_tags[t] = del_ts
+            elif there and (not here or r_ts > l_ts):
+                if not here:
+                    self.tags.append(t)
+                    stats["tags_in"] += 1
+                if t in r_colors:
+                    self.tag_colors[t] = r_colors[t]
+                self.tag_updated[t] = r_ts
+                self.deleted_tags.pop(t, None)
+        for b in self.books.values():               # a book may use a tag we don't list
+            for t in b.get("tags", []):
+                if t not in self.tags:
+                    self.tags.append(t)
+                    self.tag_colors.setdefault(t, self._next_color())
+        for t in self.tags:
+            self.tag_colors.setdefault(t, self._next_color())
+
+        self._take_snapshot()                        # merged state isn't a local edit
+        self.save()
+        return stats
 
     def _rebase(self, old_root):
         """The books folder changed: map every entry to its path in the new folder.
@@ -181,9 +335,12 @@ class Library:
         new_root = os.path.abspath(self.all_dir)
         rebased = {}
         for rel, b in self.books.items():
-            nrel = os.path.relpath(os.path.join(os.path.abspath(old_root), rel), new_root)
+            nrel = os.path.relpath(os.path.join(os.path.abspath(old_root), *rel.split("/")),
+                                   new_root)
             if nrel == os.pardir or nrel.startswith(os.pardir + os.sep):
                 nrel = rel                          # outside the new folder
+            else:
+                nrel = to_key(nrel)
             if nrel in rebased:
                 _merge_entry(rebased[nrel], b)
             else:
@@ -192,17 +349,13 @@ class Library:
 
     def save(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self.tags.sort(key=str.lower)
-        data = {"version": 1,
-                # Book keys are relative to this folder; used to remap if it changes.
-                "books_dir": os.path.abspath(self.all_dir),
-                "tags": self.tags,
-                "tag_colors": {t: self.tag_colors[t] for t in self.tags if t in self.tag_colors},
-                "books": dict(sorted(self.books.items(), key=lambda kv: kv[0].lower()))}
+        self._stamp_changes()
+        data = self.to_data()
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, self.path)
+        self._take_snapshot()
 
     # ---- sync with disk ----
     def import_files(self, paths, move=False):
@@ -242,7 +395,7 @@ class Library:
                 shutil.move(src, dest)
             else:
                 shutil.copy2(src, dest)
-            rel = os.path.relpath(dest, self.all_dir)
+            rel = to_key(os.path.relpath(dest, self.all_dir))
             title, author = parse_name(name)
             self.books[rel] = {"title": title, "author": author,
                                "format": ext[1:].lower(), "tags": [],
@@ -310,7 +463,8 @@ class Library:
         for dirpath, _, files in os.walk(self.all_dir):
             for name in files:
                 if os.path.splitext(name)[1].lower() in BOOK_EXTS:
-                    found.add(os.path.relpath(os.path.join(dirpath, name), self.all_dir))
+                    found.add(to_key(os.path.relpath(os.path.join(dirpath, name),
+                                                     self.all_dir)))
         added = 0
         for rel in found:
             b = self.books.get(rel)
@@ -331,7 +485,7 @@ class Library:
         return added, missing
 
     def abspath(self, rel):
-        return os.path.join(self.all_dir, rel)
+        return os.path.join(self.all_dir, *rel.split("/"))
 
     # ---- tags ----
     def add_tag(self, tag):

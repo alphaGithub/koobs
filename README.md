@@ -101,6 +101,18 @@ right-click, or just press **1–4**. Koobs notes when you started and finished.
 
 Nothing destructive happens without a confirmation, and **Cancel** is always the default.
 
+### ☁️ Sync with Google Drive (Linux)
+Keep your books, tags and reading progress the same on all your Linux computers.
+Open **⚙ Settings → Sync**, click **Connect Google Drive**, and sign in. Then:
+
+- **⟳ Sync** in the toolbar syncs on demand, and Koobs also syncs when it opens and closes.
+- On a new computer: install Koobs, connect the same Drive, and everything (books, tags, statuses, pages) downloads.
+- Edits from different computers are **merged**, never overwritten. If the same book was changed on both, the newer change wins.
+- A book removed on one computer goes to the **Trash** on the others, so it can still be restored. If many books would go at once, Koobs asks first.
+- Koobs can only see the `Koobs` folder it creates in your Drive, nothing else.
+
+<sub>Sync uses <a href="https://rclone.org">rclone</a>: <code>sudo apt install rclone</code>. Your window layout and folder paths stay local to each computer.</sub>
+
 ### 🎨 Five themes, switched live
 **Ink** · **Paper** · **Sepia** · **Night** · **Slate.** Pick one in ⚙ **Settings** and the whole app
 changes instantly, with no restart.
@@ -157,6 +169,7 @@ app/
 ├── ui.py       the interface: themes, card list, sidebar, dialogs
 ├── store.py    the library: config, scanning, tags, status, import / trash / move-out
 ├── osutil.py   OS specifics: open files, Trash / Recycle Bin, settings folder
+├── sync.py     Google Drive sync via rclone (Linux): merge, transfers, safety checks
 └── tagger.py   one-off bulk tagger used to seed the first library
 run.sh          launcher for Linux / macOS
 Koobs.pyw       double-click launcher for Windows (no console window)
