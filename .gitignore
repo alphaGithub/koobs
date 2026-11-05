@@ -1,0 +1,38 @@
+# ---- Koobs user content (chosen on first run; never committed) ----
+# Book files
+/All/
+# App data: tags, colors, window state (library.json, ui.json)
+/.local/
+# Stray book files anywhere in the repo
+*.pdf
+*.epub
+*.mobi
+*.azw3
+*.djvu
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# ---- Temp / atomic-write leftovers ----
+*.tmp
+*.bak
+*~
+
+# ---- Editors & OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.directory
+
+# ---- Claude Code local settings ----
+.claude/settings.local.json
